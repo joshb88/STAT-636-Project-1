@@ -1,0 +1,546 @@
+---
+title: "Developer Specialization in the GitHub Social Network"
+subtitle: "STAT 636 · Final Project 9 · Exploratory report"
+author:
+  - John Whitney
+  - Josh Boehm
+  - Neil Roche
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: true
+    code-summary: "Show R code"
+    embed-resources: true
+    theme: cosmo
+execute:
+  echo: true
+  message: false
+  warning: true
+  error: false
+---
+
+# Introduction
+
+Do web developers and machine learning (ML) developers occupy different positions or have different connection patterns in the GitHub social network? We investigate five questions:
+
+1. Do the groups differ in their numbers of connections?
+2. Do they differ in clustering and centrality?
+3. Do developers of the same type connect more often than expected by chance?
+4. Can network characteristics predict developer type?
+5. Does network information improve prediction beyond profile attributes?
+
+This is an exploratory analysis of one observed network. Group comparisons describe associations; they do not establish why developers form connections.
+
+```{r}
+#| label: setup
+#| include: false
+library(dplyr)
+library(ggplot2)
+library(igraph)
+library(jsonlite)
+library(Matrix)
+library(glmnet)
+library(pROC)
+library(PRROC)
+
+knitr::opts_chunk$set(fig.width = 8, fig.height = 5, dpi = 120)
+theme_set(theme_minimal(base_size = 12))
+type_colors <- c("Web" = "#2878A5", "ML" = "#D87528")
+fmt <- function(x, digits = 2) formatC(x, format = "f", digits = digits)
+fmt_p <- function(x) format.pval(x, digits = 3, eps = 0.001)
+```
+
+# Data and network construction
+
+The [Stanford SNAP GitHub Social Network dataset](https://snap.stanford.edu/data/github-social.html) was collected in June 2019. Nodes represent developers who starred at least ten repositories; undirected edges represent mutual follower relationships. Developer type is derived from job titles. We interpret `ml_target = 0` as web and `ml_target = 1` as ML, following the original analysis.
+
+Profile features are supplied as anonymized indices rather than named variables. We therefore use them as binary indicators and do not interpret particular coefficients as employer or location effects.
+
+The following chunk downloads the original ZIP to temporary R-session storage. No separate data or results folders are needed. Node IDs are used explicitly to align labels, network measures, and profile features.
+
+```{r}
+#| label: load-data
+temp_dir <- tempdir()
+data_dir <- file.path(temp_dir, "git_web_ml")
+required_files <- file.path(data_dir, c(
+  "musae_git_edges.csv", "musae_git_target.csv", "musae_git_features.json"
+))
+if (!all(file.exists(required_files))) {
+  temp_zip <- tempfile(fileext = ".zip")
+  download.file("https://snap.stanford.edu/data/git_web_ml.zip",
+                temp_zip, mode = "wb", quiet = TRUE)
+  unzip(temp_zip, exdir = temp_dir)
+  unlink(temp_zip)
+}
+edges <- read.csv(required_files[1])
+nodes <- read.csv(required_files[2])
+stopifnot(!anyNA(nodes$id), !anyDuplicated(nodes$id),
+          !anyNA(nodes$ml_target), all(nodes$ml_target %in% c(0, 1)))
+
+g <- graph_from_data_frame(edges[, 1:2], directed = FALSE,
+                           vertices = data.frame(name = as.character(nodes$id)))
+stopifnot(is_simple(g))
+node_order <- match(V(g)$name, as.character(nodes$id))
+stopifnot(!anyNA(node_order))
+nodes <- nodes[node_order, ]
+developer_type <- nodes$ml_target + 1L
+n_nodes <- vcount(g)
+n_edges <- ecount(g)
+
+network_summary <- data.frame(
+  Measure = c("Developers", "Mutual follower relationships", "Web developers",
+              "ML developers", "Density", "Global transitivity"),
+  Value = c(format(n_nodes, big.mark = ","), format(n_edges, big.mark = ","),
+            sum(nodes$ml_target == 0), sum(nodes$ml_target == 1),
+            fmt(edge_density(g), 6), fmt(transitivity(g), 4))
+)
+knitr::kable(network_summary, caption = "Characteristics of the observed network.")
+```
+
+The two groups are unequal in size: `r fmt(100 * mean(nodes$ml_target == 0), 1)`% of developers are web developers. This imbalance matters both for expected within-group connections and for classification evaluation.
+
+# Question 1: Number of connections
+
+A developer's degree is the number of other developers to whom they are connected. We summarize degree separately by developer type and use a logarithmic scale in the plot to display the long upper tail.
+
+```{r}
+#| label: degree-summary
+eda_df <- data.frame(
+  id = nodes$id,
+  ml_target = nodes$ml_target,
+  developer = factor(nodes$ml_target, levels = c(0, 1), labels = c("Web", "ML")),
+  degree = as.numeric(degree(g))
+)
+degree_summary <- eda_df |>
+  group_by(developer) |>
+  summarise(N = n(), Mean = mean(degree), SD = sd(degree),
+            Median = median(degree), IQR = IQR(degree), .groups = "drop")
+knitr::kable(degree_summary, digits = 2,
+             caption = "Degree distribution by developer type.")
+```
+
+```{r}
+#| label: fig-degree
+#| fig-cap: "Degree by developer type. The vertical axis uses log10(degree + 1)."
+ggplot(eda_df, aes(developer, log10(degree + 1), fill = developer)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  scale_fill_manual(values = type_colors, guide = "none") +
+  labs(x = "Developer type", y = "log10(degree + 1)")
+```
+
+We report the Wilcoxon rank-sum test as an exploratory comparison of degree distributions and Welch's test as a comparison of mean log-transformed degree. The Wilcoxon test is not generally a test of medians alone; the log transformation does not guarantee normality. Both procedures assume independent observations, an assumption that may fail for connected developers. Their conventional p-values therefore require caution.
+
+```{r}
+#| label: degree-tests
+degree_wilcox <- wilcox.test(degree ~ developer, data = eda_df, exact = FALSE)
+degree_welch <- t.test(log1p(degree) ~ developer, data = eda_df)
+knitr::kable(data.frame(
+  Test = c("Wilcoxon: degree", "Welch: log(1 + degree)"),
+  Statistic = c(unname(degree_wilcox$statistic), unname(degree_welch$statistic)),
+  `Conventional p-value` = c(fmt_p(degree_wilcox$p.value), fmt_p(degree_welch$p.value)),
+  check.names = FALSE
+), digits = 3)
+```
+
+Mean degree is `r fmt(mean(eda_df$degree[eda_df$developer == "Web"]))` for web developers and `r fmt(mean(eda_df$degree[eda_df$developer == "ML"]))` for ML developers. The descriptive difference is more directly interpretable here than a claim based solely on conventional significance tests.
+
+# Question 2: Clustering and centrality
+
+We measure local clustering (the fraction of possible neighbor-to-neighbor connections present), PageRank, betweenness, and eigenvector centrality. These measures capture different aspects of local cohesion and network position. Local clustering is assigned zero for nodes with fewer than two neighbors. Exact betweenness is calculated on the full graph and may make rendering take several minutes.
+
+```{r}
+#| label: centrality
+#| cache: true
+#| cache.extra: !expr digest::digest(list(g, eda_df))
+eda_df$clustering <- transitivity(g, type = "local", isolates = "zero")
+eda_df$pagerank <- page_rank(g)$vector
+eda_df$betweenness <- betweenness(g, directed = FALSE, normalized = TRUE)
+eda_df$eigenvector <- eigen_centrality(g)$vector
+centrality_summary <- eda_df |>
+  group_by(developer) |>
+  summarise(across(c(clustering, pagerank, betweenness, eigenvector), median),
+            .groups = "drop")
+knitr::kable(centrality_summary, digits = 6,
+             caption = "Median clustering and centrality by developer type.")
+
+metrics <- c("clustering", "pagerank", "betweenness", "eigenvector")
+centrality_p <- vapply(metrics, function(metric) {
+  wilcox.test(eda_df[[metric]] ~ eda_df$developer, exact = FALSE)$p.value
+}, numeric(1))
+knitr::kable(data.frame(
+  Measure = metrics,
+  `Conventional p-value` = vapply(centrality_p, fmt_p, character(1)),
+  `Holm-adjusted p-value` = vapply(p.adjust(centrality_p, "holm"), fmt_p, character(1)),
+  check.names = FALSE
+), caption = "Exploratory Wilcoxon comparisons; network dependence remains unaccounted for.")
+```
+
+```{r}
+#| label: fig-clustering
+#| fig-cap: "Distribution of local clustering by developer type."
+ggplot(eda_df, aes(developer, clustering, fill = developer)) +
+  geom_boxplot(outlier.alpha = 0.15) +
+  scale_fill_manual(values = type_colors, guide = "none") +
+  labs(x = "Developer type", y = "Local clustering coefficient")
+```
+
+```{r}
+#| label: fig-pagerank
+#| fig-cap: "PageRank by developer type on a logarithmic scale."
+ggplot(eda_df, aes(developer, pagerank, fill = developer)) +
+  geom_boxplot(outlier.alpha = 0.15) + scale_y_log10() +
+  scale_fill_manual(values = type_colors, guide = "none") +
+  labs(x = "Developer type", y = "PageRank (log scale)")
+```
+
+Holm adjustment addresses the four comparisons within this section, but does not correct network dependence. We treat these results as exploratory evidence about the observed graph.
+
+# Question 3: Developer-type homophily
+
+## Observed mixing
+
+A high fraction of same-type edges is insufficient by itself to establish homophily: even random labeling produces many web–web edges when web developers form the majority. We first count each undirected edge once and compare the counts with their exact expectations when labels are assigned at random while group sizes remain fixed.
+
+For group sizes $n_W$ and $n_M$ in a network with $n$ developers, the expected same-type edge fraction under this random-label null is
+
+$$
+P_{\mathrm{same}} =
+\frac{n_W(n_W-1) + n_M(n_M-1)}{n(n-1)}.
+$$
+
+```{r}
+#| label: mixing
+edge_endpoints <- as_edgelist(g, names = FALSE)
+type_from <- developer_type[edge_endpoints[, 1]]
+type_to <- developer_type[edge_endpoints[, 2]]
+edge_category <- ifelse(type_from == 1 & type_to == 1, "Web-Web",
+                        ifelse(type_from == 2 & type_to == 2, "ML-ML", "Web-ML"))
+mixing_summary <- data.frame(connection = factor(
+  edge_category, levels = c("Web-Web", "Web-ML", "ML-ML")
+)) |> count(connection, .drop = FALSE)
+group_sizes <- tabulate(developer_type, nbins = 2)
+expected_fraction <- c(
+  group_sizes[1] * (group_sizes[1] - 1),
+  2 * prod(group_sizes),
+  group_sizes[2] * (group_sizes[2] - 1)
+) / (n_nodes * (n_nodes - 1))
+mixing_summary$observed_percent <- 100 * mixing_summary$n / n_edges
+mixing_summary$expected_edges <- n_edges * expected_fraction
+mixing_summary$expected_percent <- 100 * expected_fraction
+same_type_fraction <- mean(type_from == type_to)
+expected_same <- sum(expected_fraction[c(1, 3)])
+knitr::kable(mixing_summary, digits = 2,
+             caption = "Observed mixing and expectations under random labeling.")
+```
+
+Same-type edges account for **`r fmt(100 * same_type_fraction)`%** of connections, compared with **`r fmt(100 * expected_same)`%** under random labeling: a difference of **`r fmt(100 * (same_type_fraction - expected_same))` percentage points**.
+
+## Assortativity
+
+We quantify categorical mixing using [Newman's nominal assortativity coefficient as implemented in igraph](https://r.igraph.org/reference/assortativity.html):
+
+$$
+r = \frac{\sum_i e_{ii} - \sum_i a_i^2}{1-\sum_i a_i^2},
+\qquad a_i = \sum_j e_{ij}.
+$$
+
+For an undirected graph, $e_{ij}$ describes mixing across oriented edge endpoints, with each undirected edge contributing in both directions. The marginal $a_i$ is the fraction of edge endpoints in group $i$. Positive $r$ indicates same-type mixing, zero indicates the coefficient's random-mixing baseline, and negative values indicate cross-type mixing. This endpoint-based baseline differs from the node-count baseline above.
+
+```{r}
+#| label: assortativity
+observed_assortativity <- assortativity_nominal(
+  g, types = developer_type, directed = FALSE
+)
+```
+
+Observed assortativity is **`r fmt(observed_assortativity, 4)`**.
+
+## Random-label permutation test
+
+The null hypothesis is that developer labels are exchangeable across vertices, conditional on the observed network and group sizes. The one-sided alternative is that assortativity is greater than under this null.
+
+We hold the entire graph fixed and shuffle developer labels $B=999$ times. The test statistic is **assortativity**, consistent with the assortativity analysis above. The Monte Carlo p-value is
+
+$$
+\widehat p = \frac{1 + \sum_{b=1}^{B} I(r_b \geq r_{\mathrm{obs}})}{B+1}.
+$$
+
+This uses the network as a whole rather than treating its edges as independent observations.
+
+```{r}
+#| label: permutation-test
+#| cache: true
+#| cache.extra: !expr digest::digest(list(g, developer_type, observed_assortativity))
+set.seed(636)
+B <- 999L
+permuted_assortativity <- replicate(B, {
+  assortativity_nominal(g, types = sample(developer_type), directed = FALSE)
+})
+n_exceed <- sum(permuted_assortativity >= observed_assortativity)
+permutation_p <- (1 + n_exceed) / (B + 1)
+homophily_results <- data.frame(
+  Measure = c("Observed assortativity", "Mean permuted assortativity",
+              "Permutations at least as large as observed", "Permutations",
+              "One-sided Monte Carlo p-value"),
+  Value = c(fmt(observed_assortativity, 4), fmt(mean(permuted_assortativity), 4),
+            n_exceed, B, fmt(permutation_p, 4))
+)
+knitr::kable(homophily_results, caption = "Random-label permutation test of assortativity.")
+```
+
+```{r}
+#| label: fig-permutation
+#| fig-cap: "Assortativity after randomly shuffling developer labels. The red line marks the observed value."
+ggplot(data.frame(assortativity = permuted_assortativity), aes(assortativity)) +
+  geom_histogram(bins = 40, fill = "#2878A5", color = "white") +
+  geom_vline(xintercept = observed_assortativity, color = "firebrick", linewidth = 1) +
+  labs(x = "Categorical assortativity", y = "Number of permutations")
+```
+
+The observed value was met or exceeded by **`r n_exceed` of `r B`** permutations, giving **$\widehat p =$ `r fmt(permutation_p, 4)`**. `r if (observed_assortativity > 0 && permutation_p < 0.05) "This provides evidence of positive same-type mixing relative to the random-label null." else "This does not establish positive same-type mixing beyond the random-label null at the 5% level."` With 999 permutations, the smallest possible reported p-value is 0.001; zero exceedances do not imply a true p-value of zero.
+
+## Interpretation and limitations
+
+The observed pattern is an association between specialty and connections, not proof that specialization causes developers to choose one another. Random labeling preserves every node's degree, but does **not** preserve the relationship between developer type and degree. Employer, location, and existing communities may also contribute.
+
+The mixing table distinguishes group-specific patterns: an overall excess of same-type edges need not imply equally strong excess within both groups. A useful refinement is to shuffle labels within degree strata. An ERGM could address a more explicit model of tie formation, but requires careful specification and diagnostics; it is not fitted in this first pass.
+
+# Question 4: Predicting developer type from network characteristics
+
+A goal of ours is to determine whether we can predict whether someone is a web or machine learning developer. To do so, we constructed a dataset where each node is an observation and each predictor is derived from network characteristics such as degree, PageRank, clustering coefficient, betweenness centrality, eigenvector centrality, and spectral embedding coordinates derived from singular value decomposition. We then fit a classification model (regularized logistic regression (Lasso)) to predict whether the node is a web or ML developer.
+
+## Scree plot
+
+To decide on the right number of dimensions, or the number of coordinate columns we want our singular value decomposition (and ultimately our adjacency spectral embedding) to output, we look at a scree plot which ranks dimensions by how much structural weight or importance they carry. For the symmetric adjacency matrix, the magnitudes of its eigenvalues are its singular values. We inspect the 40 largest magnitudes and mark candidate dimensions 3, 5, and 10.
+
+The scree plot indicates an elbow at $d=5$ (the green line), providing a choice that captures important network structure without making the model too complex. We use five dimensions for the adjacency spectral embedding. We also compute an automated profile-likelihood dimension selection as a diagnostic.
+
+```{r}
+#| label: spectral-features
+#| cache: true
+#| cache.extra: !expr digest::digest(g)
+set.seed(42)
+adjacency_spectrum <- spectrum(
+  g, algorithm = "arpack", which = list(pos = "lm", howmany = 40)
+)
+top_evals <- sort(abs(adjacency_spectrum$values), decreasing = TRUE)
+optimal_d <- dim_select(top_evals)
+d_chosen <- 5L
+
+# Reuse igraph's sparse spectral implementation; no dense adjacency matrix.
+# cvec = 0 specifies the original, unaugmented adjacency matrix.
+set.seed(42)
+ase_result <- embed_adjacency_matrix(
+  g, no = d_chosen, weights = NA, which = "lm", scaled = TRUE,
+  cvec = rep(0, vcount(g))
+)
+ase_matrix <- ase_result$X
+colnames(ase_matrix) <- paste0("ASE_Dim", seq_len(d_chosen))
+stopifnot(nrow(ase_matrix) == nrow(eda_df), all(is.finite(ase_matrix)))
+```
+
+```{r}
+#| label: fig-spectral-scree
+#| fig-cap: "The 40 largest absolute adjacency eigenvalues, with candidate embedding dimensions."
+plot(top_evals, type = "b", pch = 19, col = "#2878A5",
+     xlab = "Eigenvalue index", ylab = "Absolute eigenvalue",
+     main = "GitHub adjacency spectrum")
+abline(v = c(3, 5, 10), col = c("firebrick", "forestgreen", "blue"), lty = 2)
+legend("topright", c("d = 3", "d = 5 (selected)", "d = 10"),
+       col = c("firebrick", "forestgreen", "blue"), lty = 2, bty = "n")
+```
+
+The profile-likelihood diagnostic selects **`r optimal_d`** dimensions; the fitted models use **`r d_chosen`**. For an undirected graph, ASE scales the selected eigenvectors by the square roots of the absolute eigenvalues. Coordinates remain aligned with the node IDs used throughout the report.
+
+## Lasso model and shared comparison design
+
+Question 4 evaluates the network-only model. To support Question 5, we fit three lasso logistic regression models using the same training and test developers:
+
+| Model | Predictors |
+| --- | --- |
+| Profile only | Supplied binary profile features |
+| Network only | Degree, clustering, PageRank, betweenness, eigenvector centrality, five ASE coordinates |
+| Combined | Both sets of predictors |
+
+For a predictor vector $x_i$, each model takes the form
+
+$$
+\log\left\{\frac{P(Y_i=1\mid x_i)}{1-P(Y_i=1\mid x_i)}\right\}
+= \beta_0 + x_i^\top\beta,
+$$
+
+with an $L_1$ penalty on coefficients. Here $Y_i=1$ denotes an ML developer. The lasso penalty can set redundant or weak predictor coefficients to zero.
+
+## Feature alignment and evaluation design
+
+The JSON is keyed by node ID. We explicitly reorder its entries to match the network before creating the sparse binary feature matrix. We use a stratified 70/30 split and five stratified cross-validation folds within the training set. All models share those folds. The penalty is chosen by training cross-validation ROC-AUC; test ROC-AUC is reported only after fitting.
+
+`glmnet` standardizes predictors within each fit, avoiding full-dataset scaling before the split. Network measures and ASE are computed on the full observed graph without using developer labels. Consequently, this is a **transductive** experiment: it predicts unknown labels for developers whose connections are already known. Random node splitting does not test transfer to independent communities or future developers.
+
+```{r}
+#| label: classification-data
+node_features <- fromJSON(required_files[3], simplifyVector = FALSE)
+feature_order <- match(as.character(eda_df$id), names(node_features))
+stopifnot(!anyNA(feature_order))
+node_features <- lapply(node_features[feature_order], as.integer)
+feature_ids <- unlist(node_features, use.names = FALSE)
+stopifnot(!anyNA(feature_ids), all(feature_ids >= 0))
+feature_matrix <- sparseMatrix(
+  i = rep(seq_along(node_features), lengths(node_features)),
+  j = feature_ids + 1L, x = 1,
+  dims = c(nrow(eda_df), max(feature_ids) + 1L)
+)
+network_matrix <- cbind(as.matrix(eda_df[, c(
+  "degree", "pagerank", "clustering", "betweenness", "eigenvector"
+)]), ase_matrix)
+stopifnot(all(is.finite(network_matrix)))
+combined_matrix <- cbind(feature_matrix, Matrix(network_matrix, sparse = TRUE))
+y <- eda_df$ml_target
+
+set.seed(42)
+train_index <- sort(unlist(lapply(split(seq_along(y), y), function(index) {
+  sample(index, floor(0.7 * length(index)))
+}), use.names = FALSE))
+test_index <- setdiff(seq_along(y), train_index)
+y_train <- y[train_index]
+y_test <- y[test_index]
+fold_id <- integer(length(train_index))
+for (label in c(0, 1)) {
+  index <- which(y_train == label)
+  fold_id[index] <- sample(rep(1:5, length.out = length(index)))
+}
+```
+
+```{r}
+#| label: fit-models
+#| cache: true
+#| cache.extra: !expr digest::digest(list(feature_matrix, network_matrix, combined_matrix, train_index, test_index, y_train, y_test, fold_id))
+predictor_sets <- list("Profile only" = feature_matrix,
+                       "Network only" = network_matrix,
+                       "Combined" = combined_matrix)
+fits <- lapply(predictor_sets, function(x) {
+  cv.glmnet(x[train_index, , drop = FALSE], y_train,
+            family = "binomial", alpha = 1, standardize = TRUE,
+            foldid = fold_id, type.measure = "auc")
+})
+test_probabilities <- lapply(names(predictor_sets), function(model) {
+  as.numeric(predict(fits[[model]],
+    newx = predictor_sets[[model]][test_index, , drop = FALSE],
+    s = "lambda.min", type = "response"))
+})
+names(test_probabilities) <- names(predictor_sets)
+roc_objects <- lapply(test_probabilities, function(probability) {
+  roc(y_test, probability, levels = c(0, 1), direction = "<", quiet = TRUE)
+})
+test_auc <- vapply(roc_objects, function(object) as.numeric(auc(object)), numeric(1))
+model_comparison <- data.frame(
+  Model = names(test_auc),
+  `Test ROC-AUC` = unname(test_auc),
+  `Selected lambda` = vapply(fits, function(fit) fit$lambda.min, numeric(1)),
+  check.names = FALSE
+)
+knitr::kable(model_comparison, digits = 4,
+             caption = "Held-out performance on the same test developers.")
+```
+
+## Results from Lasso
+
+```{r}
+#| label: q4-coefficients
+q4_coefficients <- as.matrix(coef(fits[["Network only"]], s = "lambda.min"))
+# glmnet returns coefficients on the original predictor scales.
+# Multiply by training SDs to express slopes per training standard deviation.
+q4_training_sd <- apply(network_matrix[train_index, , drop = FALSE], 2, sd)
+q4_standardized <- q4_coefficients[, 1]
+q4_standardized[-1] <- q4_standardized[-1] * q4_training_sd
+knitr::kable(data.frame(
+  Predictor = rownames(q4_coefficients),
+  Coefficient = q4_coefficients[, 1],
+  `Coefficient per training SD` = q4_standardized,
+  check.names = FALSE
+), digits = 4, row.names = FALSE,
+caption = "Network-only lasso coefficients; zero indicates a predictor excluded by the penalty.")
+```
+
+Since we are predicting ML developer (ML = 1, Web = 0), a positive coefficient means that the feature predicts an ML developer while a negative coefficient indicates that the feature predicts a web developer, holding the other predictors fixed. The coefficient table shows both the original predictor scale and the effect per training standard deviation so that features on different scales can be compared.
+
+PageRank describes the importance of a developer's connections within the network, while degree describes how many connections a developer has. A positive PageRank coefficient and negative degree coefficient would indicate that, despite having fewer connections, ML developers' connections may be with influential individuals within the network. Eigenvector centrality similarly reflects connections to central developers, while betweenness describes a developer's role as a bridge between different subcommunities. These coefficient interpretations describe associations within the model.
+
+The five-dimensional coordinates from the adjacency spectral embedding allow the model to capture latent connectivity patterns beyond the centrality metrics. A dimension with a zero coefficient is dropped by the lasso model; dimensions that remain in the model contribute to predicting ML and web developers. The signs of the ASE coordinates are arbitrary, so interpretation focuses on the connectivity information they add rather than the direction of an individual coordinate.
+
+```{r}
+#| label: q4-performance
+q4_probability <- test_probabilities[["Network only"]]
+pr_q4 <- PRROC::pr.curve(
+  scores.class0 = q4_probability[y_test == 1],
+  scores.class1 = q4_probability[y_test == 0],
+  curve = TRUE
+)
+q4_pr_baseline <- mean(y_test == 1)
+knitr::kable(data.frame(
+  Measure = c("Test ROC-AUC", "Test PR-AUC", "Test ML prevalence (PR baseline)"),
+  Value = c(test_auc["Network only"], pr_q4$auc.integral, q4_pr_baseline)
+), digits = 4, caption = "Held-out network-only performance, treating ML as the positive class.")
+```
+
+## ROC curve
+
+```{r}
+#| label: fig-q4-roc
+#| fig-cap: "Held-out ROC curve for the network-only model."
+plot(roc_objects[["Network only"]], col = "#D87528", lwd = 2,
+     legacy.axes = TRUE, main = "Question 4: Network-only ROC curve")
+```
+
+The ROC curve shows how well network structure predicts developer type, with an AUC of **`r fmt(test_auc["Network only"], 3)`**.
+
+## Precision–recall AUC
+
+Because web developers outnumber machine learning developers roughly 3-to-1, we also evaluated the Precision–Recall AUC (PR-AUC).
+
+```{r}
+#| label: fig-q4-pr
+#| fig-cap: "Held-out precision–recall curve for ML developers; the dashed line marks test-set ML prevalence."
+plot(pr_q4, color = "#2878A5", main = "Question 4: Precision–recall curve")
+abline(h = q4_pr_baseline, lty = 2, col = "gray40")
+```
+
+The model achieved a PR-AUC of **`r fmt(pr_q4$auc.integral, 3)`**, compared with the random-ranking baseline of **`r fmt(q4_pr_baseline, 3)`**, the proportion of ML developers in the test set. Performance above this baseline indicates that the network features help identify the minority machine learning class despite the skewed dataset.
+
+# Question 5: Does network information improve prediction beyond profile attributes?
+
+The profile-only, network-only, and combined models above use identical held-out developers and training folds. The network and combined models both include the five ASE coordinates.
+
+```{r}
+#| label: fig-roc
+#| fig-cap: "Test-set ROC curves for the three predictor sets."
+roc_colors <- c("#2878A5", "#D87528", "#31844A")
+plot(roc_objects[[1]], col = roc_colors[1], lwd = 2, legacy.axes = TRUE,
+     main = "Predicting ML developer labels")
+for (i in 2:3) lines(roc_objects[[i]], col = roc_colors[i], lwd = 2)
+legend("bottomright", sprintf("%s (AUC %.3f)", names(test_auc), test_auc),
+       col = roc_colors, lwd = 2, bty = "n", cex = 0.8)
+```
+
+The network-only model achieves a test ROC-AUC of **`r fmt(test_auc["Network only"], 3)`**. The combined model has ROC-AUC **`r fmt(test_auc["Combined"], 3)`**, compared with **`r fmt(test_auc["Profile only"], 3)`** for profile attributes alone. The combined-minus-profile difference is **`r fmt(test_auc["Combined"] - test_auc["Profile only"], 4)`**.
+
+This single split estimates predictive performance for the stated setting. A small AUC difference alone does not establish a reliable improvement. Repeated splits or community-based validation would help assess stability and generalization. The Question 4 PR curve supplements ROC-AUC for the minority ML class; threshold-specific measures would further describe the practical tradeoff between false positives and missed ML developers.
+
+# Discussion and next steps
+
+The report separates descriptive group differences, random-label evidence about homophily, and predictive comparisons. These answer related but distinct questions. Conventional node-level tests and random train/test splits require particular care because developers are connected.
+
+The next analysis priorities are to assess homophily conditional on degree, evaluate model stability with splits that reflect the intended prediction setting, and examine minority-class performance. Conclusions concern the observed 2019 network rather than all GitHub users or current developer behavior.
+
+# Reproducibility
+
+Render this file using RStudio's **Render** button or run `quarto render "GitHub Report.qmd"` from this directory. The output is an HTML report with a table of contents, equations, tables, figures, and expandable code. The prose lives directly in this document; numeric results are inserted from executed R objects.
+
+The first render requires internet access for the SNAP download. Required R packages are `dplyr`, `ggplot2`, `igraph`, `jsonlite`, `Matrix`, `glmnet`, `pROC`, `PRROC`, `knitr`, and `rmarkdown`. PDF output can be added later with a LaTeX installation.
+
+```{r}
+#| label: session-info
+#| code-fold: true
+sessionInfo()
+```

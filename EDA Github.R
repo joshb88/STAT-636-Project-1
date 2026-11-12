@@ -217,6 +217,193 @@ p2 <- ggplot(eda_df, aes(x = factor(ml_target), y = pagerank, fill = factor(ml_t
 # Plan: Compute assortativity coefficient and fit an ERGM to test
 # whether homophily is greater than expected by chance.
 
+
+# ==================================================================
+# 3. Do developers of the same type tend to connect to one another
+#    more often than would be expected by chance?
+# ==================================================================
+# Plan:
+# 1) Summarize connections within and between developer types.
+# 2) Calculate categorical assortativity.
+# 3) Use a permutation test to assess whether assortativity is
+#    greater than expected under randomly assigned developer labels.
+
+# ------------------------------------------------------------------
+# Align developer labels with the graph's vertex order
+# ------------------------------------------------------------------
+
+# Use actual node IDs rather than assuming table rows match vertices.
+stopifnot(
+  !anyDuplicated(nodes$id),
+  !is_directed(g),
+  is_simple(g)
+)
+
+node_order <- match(V(g)$name, as.character(nodes$id))
+developer_type <- nodes$ml_target[node_order]
+
+stopifnot(
+  !anyNA(node_order),
+  !anyNA(developer_type),
+  all(developer_type %in% c(0, 1)),
+  length(unique(developer_type)) == 2
+)
+
+# igraph's nominal assortativity uses integer categories starting at 1.
+# Here: 1 = Web, 2 = Machine Learning.
+developer_type <- as.integer(developer_type) + 1L
+
+# ------------------------------------------------------------------
+# Summarize connections within and between developer types
+# ------------------------------------------------------------------
+
+# Each row gives the vertex indices at the two ends of an edge.
+edge_endpoints <- as_edgelist(g, names = FALSE)
+
+type_from <- developer_type[edge_endpoints[, 1]]
+type_to   <- developer_type[edge_endpoints[, 2]]
+
+edge_category <- ifelse(
+  type_from == 1 & type_to == 1, "Web-Web",
+  ifelse(type_from == 2 & type_to == 2, "ML-ML", "Web-ML")
+)
+
+mixing_summary <- tibble(
+  connection = factor(
+    edge_category,
+    levels = c("Web-Web", "Web-ML", "ML-ML")
+  )
+) %>%
+  count(connection, .drop = FALSE) %>%
+  mutate(percent = 100 * n / sum(n))
+
+print(mixing_summary)
+
+same_type_fraction <- mean(type_from == type_to)
+
+cat(
+  "Percentage of edges connecting the same developer type:",
+  round(100 * same_type_fraction, 2), "%\n"
+)
+
+# A high same-type percentage alone does not establish homophily:
+# the two developer groups have different sizes.
+
+# ------------------------------------------------------------------
+# Calculate observed categorical assortativity
+# ------------------------------------------------------------------
+
+observed_assortativity <- assortativity_nominal(
+  g,
+  types = developer_type,
+  directed = FALSE
+)
+
+cat("Observed assortativity:", observed_assortativity, "\n")
+
+# Positive assortativity indicates a tendency toward same-type
+# connections; negative assortativity indicates cross-type mixing.
+
+# ------------------------------------------------------------------
+# Permutation test
+# ------------------------------------------------------------------
+# H0: Developer labels are exchangeable across nodes, conditional on
+#     the observed network and the number of developers in each group.
+# H1: Observed assortativity is greater than expected under H0.
+#
+# Keep all edges fixed and shuffle labels. This preserves the network
+# structure and group sizes, but not group-specific degree patterns.
+
+set.seed(636)
+
+B <- 999L # Increase to 9999 for the final analysis.
+
+permuted_assortativity <- replicate(B, {
+  shuffled_type <- sample(developer_type)
+
+  assortativity_nominal(
+    g,
+    types = shuffled_type,
+    directed = FALSE
+  )
+})
+
+# One-sided Monte Carlo p-value, including the observed assignment.
+permutation_p <- (
+  1 + sum(permuted_assortativity >= observed_assortativity)
+) / (B + 1)
+
+homophily_results <- tibble(
+  observed_assortativity = observed_assortativity,
+  mean_permuted_assortativity = mean(permuted_assortativity),
+  excess_over_permutation_mean =
+    observed_assortativity - mean(permuted_assortativity),
+  same_type_percent = 100 * same_type_fraction,
+  permutations = B,
+  p_value = permutation_p
+)
+
+print(homophily_results, width = Inf)
+
+# ------------------------------------------------------------------
+# Visualize the permutation distribution
+# ------------------------------------------------------------------
+
+ggplot(
+  tibble(assortativity = permuted_assortativity),
+  aes(x = assortativity)
+) +
+  geom_histogram(
+    bins = 40,
+    fill = "skyblue",
+    color = "white"
+  ) +
+  geom_vline(
+    xintercept = observed_assortativity,
+    color = "firebrick",
+    linewidth = 1
+  ) +
+  labs(
+    title = "Do Developers Connect Preferentially Within Their Type?",
+    subtitle = paste0(
+      "Observed assortativity = ",
+      round(observed_assortativity, 3),
+      "; permutation p = ",
+      format.pval(permutation_p, digits = 3)
+    ),
+    x = "Categorical assortativity",
+    y = "Number of permutations",
+    caption = paste(
+      "Bars: randomly shuffled developer labels.",
+      "Red line: observed labels. Network held fixed."
+    )
+  ) +
+  theme_minimal()
+
+# ------------------------------------------------------------------
+# Interpretation
+# ------------------------------------------------------------------
+
+if (observed_assortativity > 0 && permutation_p < 0.05) {
+  cat(
+    "\nThere is evidence of same-type mixing: observed positive",
+    "assortativity exceeds what is expected when developer labels",
+    "are randomly assigned to the fixed network.\n"
+  )
+} else {
+  cat(
+    "\nThis analysis does not establish positive same-type mixing",
+    "beyond the random-label baseline at the 5% significance level.\n"
+  )
+}
+
+# This is evidence of association, not proof that specialization
+# causes developers to connect. Other characteristics may contribute.
+#
+# This test does not control for differences in degree between groups.
+# A possible follow-up is to permute labels within degree groups.
+
+
 # If full network is too complicated, use random permutation tests or
 # fitting ERGM on a representative subgraph.
 
