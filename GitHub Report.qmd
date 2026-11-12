@@ -42,6 +42,7 @@ library(jsonlite)
 library(Matrix)
 library(glmnet)
 library(pROC)
+library(PRROC)
 
 knitr::opts_chunk$set(fig.width = 8, fig.height = 5, dpi = 120)
 theme_set(theme_minimal(base_size = 12))
@@ -257,7 +258,7 @@ Observed assortativity is **`r fmt(observed_assortativity, 4)`**.
 
 The null hypothesis is that developer labels are exchangeable across vertices, conditional on the observed network and group sizes. The one-sided alternative is that assortativity is greater than under this null.
 
-We hold the entire graph fixed and shuffle developer labels $B=999$ times. The test statistic is **assortativity**, matching the current EDA script. The Monte Carlo p-value is
+We hold the entire graph fixed and shuffle developer labels $B=999$ times. The test statistic is **assortativity**, consistent with the assortativity analysis above. The Monte Carlo p-value is
 
 $$
 \widehat p = \frac{1 + \sum_{b=1}^{B} I(r_b \geq r_{\mathrm{obs}})}{B+1}.
@@ -301,14 +302,59 @@ The observed pattern is an association between specialty and connections, not pr
 
 The mixing table distinguishes group-specific patterns: an overall excess of same-type edges need not imply equally strong excess within both groups. A useful refinement is to shuffle labels within degree strata. An ERGM could address a more explicit model of tie formation, but requires careful specification and diagnostics; it is not fitted in this first pass.
 
-# Questions 4 and 5: Predicting developer type
+# Question 4: Predicting developer type from network characteristics
 
-We compare three lasso logistic regression models using the same training and test developers:
+A goal of ours is to determine whether we can predict whether someone is a web or machine learning developer. To do so, we constructed a dataset where each node is an observation and each predictor is derived from network characteristics such as degree, PageRank, clustering coefficient, betweenness centrality, eigenvector centrality, and spectral embedding coordinates derived from singular value decomposition. We then fit a classification model (regularized logistic regression (Lasso)) to predict whether the node is a web or ML developer.
+
+## Scree plot
+
+To decide on the right number of dimensions, or the number of coordinate columns we want our singular value decomposition (and ultimately our adjacency spectral embedding) to output, we look at a scree plot which ranks dimensions by how much structural weight or importance they carry. For the symmetric adjacency matrix, the magnitudes of its eigenvalues are its singular values. We inspect the 40 largest magnitudes and mark candidate dimensions 3, 5, and 10.
+
+The scree plot indicates an elbow at $d=5$ (the green line), providing a choice that captures important network structure without making the model too complex. We use five dimensions for the adjacency spectral embedding. We also compute an automated profile-likelihood dimension selection as a diagnostic.
+
+```{r}
+#| label: spectral-features
+set.seed(42)
+adjacency_spectrum <- spectrum(
+  g, algorithm = "arpack", which = list(pos = "lm", howmany = 40)
+)
+top_evals <- sort(abs(adjacency_spectrum$values), decreasing = TRUE)
+optimal_d <- dim_select(top_evals)
+d_chosen <- 5L
+
+# Reuse igraph's sparse spectral implementation; no dense adjacency matrix.
+# cvec = 0 specifies the original, unaugmented adjacency matrix.
+set.seed(42)
+ase_result <- embed_adjacency_matrix(
+  g, no = d_chosen, weights = NA, which = "lm", scaled = TRUE,
+  cvec = rep(0, vcount(g))
+)
+ase_matrix <- ase_result$X
+colnames(ase_matrix) <- paste0("ASE_Dim", seq_len(d_chosen))
+stopifnot(nrow(ase_matrix) == nrow(eda_df), all(is.finite(ase_matrix)))
+```
+
+```{r}
+#| label: fig-spectral-scree
+#| fig-cap: "The 40 largest absolute adjacency eigenvalues, with candidate embedding dimensions."
+plot(top_evals, type = "b", pch = 19, col = "#2878A5",
+     xlab = "Eigenvalue index", ylab = "Absolute eigenvalue",
+     main = "GitHub adjacency spectrum")
+abline(v = c(3, 5, 10), col = c("firebrick", "forestgreen", "blue"), lty = 2)
+legend("topright", c("d = 3", "d = 5 (selected)", "d = 10"),
+       col = c("firebrick", "forestgreen", "blue"), lty = 2, bty = "n")
+```
+
+The profile-likelihood diagnostic selects **`r optimal_d`** dimensions; the fitted models use **`r d_chosen`**. For an undirected graph, ASE scales the selected eigenvectors by the square roots of the absolute eigenvalues. Coordinates remain aligned with the node IDs used throughout the report.
+
+## Lasso model and shared comparison design
+
+Question 4 evaluates the network-only model. To support Question 5, we fit three lasso logistic regression models using the same training and test developers:
 
 | Model | Predictors |
 | --- | --- |
 | Profile only | Supplied binary profile features |
-| Network only | Degree, clustering, PageRank, betweenness, eigenvector centrality |
+| Network only | Degree, clustering, PageRank, betweenness, eigenvector centrality, five ASE coordinates |
 | Combined | Both sets of predictors |
 
 For a predictor vector $x_i$, each model takes the form
@@ -318,13 +364,13 @@ $$
 = \beta_0 + x_i^\top\beta,
 $$
 
-with an $L_1$ penalty on coefficients. Here $Y_i=1$ denotes an ML developer. Spectral embedding was proposed in the project plan but is not included in these first-pass models.
+with an $L_1$ penalty on coefficients. Here $Y_i=1$ denotes an ML developer. The lasso penalty can set redundant or weak predictor coefficients to zero.
 
 ## Feature alignment and evaluation design
 
 The JSON is keyed by node ID. We explicitly reorder its entries to match the network before creating the sparse binary feature matrix. We use a stratified 70/30 split and five stratified cross-validation folds within the training set. All models share those folds. The penalty is chosen by training cross-validation ROC-AUC; test ROC-AUC is reported only after fitting.
 
-`glmnet` standardizes predictors within each fit, avoiding full-dataset scaling before the split. Network measures are computed on the full observed graph. Consequently, this is a **transductive** experiment: it predicts unknown labels for developers whose connections are already known. Random node splitting does not test transfer to independent communities or future developers.
+`glmnet` standardizes predictors within each fit, avoiding full-dataset scaling before the split. Network measures and ASE are computed on the full observed graph without using developer labels. Consequently, this is a **transductive** experiment: it predicts unknown labels for developers whose connections are already known. Random node splitting does not test transfer to independent communities or future developers.
 
 ```{r}
 #| label: classification-data
@@ -339,9 +385,9 @@ feature_matrix <- sparseMatrix(
   j = feature_ids + 1L, x = 1,
   dims = c(nrow(eda_df), max(feature_ids) + 1L)
 )
-network_matrix <- as.matrix(eda_df[, c(
-  "degree", "clustering", "pagerank", "betweenness", "eigenvector"
-)])
+network_matrix <- cbind(as.matrix(eda_df[, c(
+  "degree", "pagerank", "clustering", "betweenness", "eigenvector"
+)]), ase_matrix)
 stopifnot(all(is.finite(network_matrix)))
 combined_matrix <- cbind(feature_matrix, Matrix(network_matrix, sparse = TRUE))
 y <- eda_df$ml_target
@@ -390,6 +436,74 @@ knitr::kable(model_comparison, digits = 4,
              caption = "Held-out performance on the same test developers.")
 ```
 
+## Results from Lasso
+
+```{r}
+#| label: q4-coefficients
+q4_coefficients <- as.matrix(coef(fits[["Network only"]], s = "lambda.min"))
+# glmnet returns coefficients on the original predictor scales.
+# Multiply by training SDs to express slopes per training standard deviation.
+q4_training_sd <- apply(network_matrix[train_index, , drop = FALSE], 2, sd)
+q4_standardized <- q4_coefficients[, 1]
+q4_standardized[-1] <- q4_standardized[-1] * q4_training_sd
+knitr::kable(data.frame(
+  Predictor = rownames(q4_coefficients),
+  Coefficient = q4_coefficients[, 1],
+  `Coefficient per training SD` = q4_standardized,
+  check.names = FALSE
+), digits = 4, row.names = FALSE,
+caption = "Network-only lasso coefficients; zero indicates a predictor excluded by the penalty.")
+```
+
+Since we are predicting ML developer (ML = 1, Web = 0), a positive coefficient means that the feature predicts an ML developer while a negative coefficient indicates that the feature predicts a web developer, holding the other predictors fixed. The coefficient table shows both the original predictor scale and the effect per training standard deviation so that features on different scales can be compared.
+
+PageRank describes the importance of a developer's connections within the network, while degree describes how many connections a developer has. A positive PageRank coefficient and negative degree coefficient would indicate that, despite having fewer connections, ML developers' connections may be with influential individuals within the network. Eigenvector centrality similarly reflects connections to central developers, while betweenness describes a developer's role as a bridge between different subcommunities. These coefficient interpretations describe associations within the model.
+
+The five-dimensional coordinates from the adjacency spectral embedding allow the model to capture latent connectivity patterns beyond the centrality metrics. A dimension with a zero coefficient is dropped by the lasso model; dimensions that remain in the model contribute to predicting ML and web developers. The signs of the ASE coordinates are arbitrary, so interpretation focuses on the connectivity information they add rather than the direction of an individual coordinate.
+
+```{r}
+#| label: q4-performance
+q4_probability <- test_probabilities[["Network only"]]
+pr_q4 <- PRROC::pr.curve(
+  scores.class0 = q4_probability[y_test == 1],
+  scores.class1 = q4_probability[y_test == 0],
+  curve = TRUE
+)
+q4_pr_baseline <- mean(y_test == 1)
+knitr::kable(data.frame(
+  Measure = c("Test ROC-AUC", "Test PR-AUC", "Test ML prevalence (PR baseline)"),
+  Value = c(test_auc["Network only"], pr_q4$auc.integral, q4_pr_baseline)
+), digits = 4, caption = "Held-out network-only performance, treating ML as the positive class.")
+```
+
+## ROC curve
+
+```{r}
+#| label: fig-q4-roc
+#| fig-cap: "Held-out ROC curve for the network-only model."
+plot(roc_objects[["Network only"]], col = "#D87528", lwd = 2,
+     legacy.axes = TRUE, main = "Question 4: Network-only ROC curve")
+```
+
+The ROC curve shows how well network structure predicts developer type, with an AUC of **`r fmt(test_auc["Network only"], 3)`**.
+
+## Precision–recall AUC
+
+Because web developers outnumber machine learning developers roughly 3-to-1, we also evaluated the Precision–Recall AUC (PR-AUC).
+
+```{r}
+#| label: fig-q4-pr
+#| fig-cap: "Held-out precision–recall curve for ML developers; the dashed line marks test-set ML prevalence."
+plot(pr_q4, color = "#2878A5", main = "Question 4: Precision–recall curve")
+abline(h = q4_pr_baseline, lty = 2, col = "gray40")
+```
+
+The model achieved a PR-AUC of **`r fmt(pr_q4$auc.integral, 3)`**, compared with the random-ranking baseline of **`r fmt(q4_pr_baseline, 3)`**, the proportion of ML developers in the test set. Performance above this baseline indicates that the network features help identify the minority machine learning class despite the skewed dataset.
+
+# Question 5: Does network information improve prediction beyond profile attributes?
+
+The profile-only, network-only, and combined models above use identical held-out developers and training folds. The network and combined models both include the five ASE coordinates.
+
 ```{r}
 #| label: fig-roc
 #| fig-cap: "Test-set ROC curves for the three predictor sets."
@@ -403,7 +517,7 @@ legend("bottomright", sprintf("%s (AUC %.3f)", names(test_auc), test_auc),
 
 The network-only model achieves a test ROC-AUC of **`r fmt(test_auc["Network only"], 3)`**. The combined model has ROC-AUC **`r fmt(test_auc["Combined"], 3)`**, compared with **`r fmt(test_auc["Profile only"], 3)`** for profile attributes alone. The combined-minus-profile difference is **`r fmt(test_auc["Combined"] - test_auc["Profile only"], 4)`**.
 
-This single split estimates predictive performance for the stated setting. A small AUC difference alone does not establish a reliable improvement. Repeated splits or community-based validation would help assess stability and generalization. ROC-AUC does not describe precision for the minority class; PR-AUC and threshold-specific measures would complement it.
+This single split estimates predictive performance for the stated setting. A small AUC difference alone does not establish a reliable improvement. Repeated splits or community-based validation would help assess stability and generalization. The Question 4 PR curve supplements ROC-AUC for the minority ML class; threshold-specific measures would further describe the practical tradeoff between false positives and missed ML developers.
 
 # Discussion and next steps
 
@@ -413,9 +527,9 @@ The next analysis priorities are to assess homophily conditional on degree, eval
 
 # Reproducibility
 
-Render this file using RStudio's **Render** button or run `quarto render "GitHub Report.qmd"` from this directory. The output is an HTML report with a table of contents, equations, tables, figures, and expandable code. The prose lives directly in this document; numeric results are inserted from executed R objects. The original R script is retained for reference.
+Render this file using RStudio's **Render** button or run `quarto render "GitHub Report.qmd"` from this directory. The output is an HTML report with a table of contents, equations, tables, figures, and expandable code. The prose lives directly in this document; numeric results are inserted from executed R objects.
 
-The first render requires internet access for the SNAP download. Required R packages are `dplyr`, `ggplot2`, `igraph`, `jsonlite`, `Matrix`, `glmnet`, `pROC`, `knitr`, and `rmarkdown`. PDF output can be added later with a LaTeX installation.
+The first render requires internet access for the SNAP download. Required R packages are `dplyr`, `ggplot2`, `igraph`, `jsonlite`, `Matrix`, `glmnet`, `pROC`, `PRROC`, `knitr`, and `rmarkdown`. PDF output can be added later with a LaTeX installation.
 
 ```{r}
 #| label: session-info
