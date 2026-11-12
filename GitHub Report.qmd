@@ -200,7 +200,7 @@ Holm adjustment addresses the four comparisons within this section, but does not
 
 ## Observed mixing
 
-A high fraction of same-type edges is insufficient by itself to establish homophily: even random labeling produces many web–web edges when web developers form the majority. We first count each undirected edge once and compare the counts with their exact expectations when labels are assigned at random while group sizes remain fixed.
+A high fraction of same-type edges is insufficient by itself to establish homophily: even random labeling produces many web-web edges when web developers form the majority. We first count each undirected edge once and compare the counts with their exact expectations when labels are assigned at random while group sizes remain fixed.
 
 For group sizes $n_W$ and $n_M$ in a network with $n$ developers, the expected same-type edge fraction under this random-label null is
 
@@ -234,7 +234,7 @@ knitr::kable(mixing_summary, digits = 2,
              caption = "Observed mixing and expectations under random labeling.")
 ```
 
-Same-type edges account for **`r fmt(100 * same_type_fraction)`%** of connections, compared with **`r fmt(100 * expected_same)`%** under random labeling: a difference of **`r fmt(100 * (same_type_fraction - expected_same))` percentage points**.
+Same-type edges account for **`r fmt(100 * same_type_fraction)`%** of connections, compared with **`r fmt(100 * expected_same)`%** under random labeling: a difference of **`r fmt(100 * (same_type_fraction - expected_same))` percentage points**. This excess is concentrated in Web-Web connections, with `r format(mixing_summary$n[1], big.mark = ",")` observed versus approximately `r format(round(mixing_summary$expected_edges[1]), big.mark = ",")` expected. ML-ML connections are only slightly above their random-label expectation, with `r format(mixing_summary$n[3], big.mark = ",")` observed versus approximately `r format(round(mixing_summary$expected_edges[3]), big.mark = ",")` expected. These comparisons account for unequal group sizes, but random labeling does not preserve differences in connectivity between the groups.
 
 ## Assortativity
 
@@ -245,7 +245,9 @@ r = \frac{\sum_i e_{ii} - \sum_i a_i^2}{1-\sum_i a_i^2},
 \qquad a_i = \sum_j e_{ij}.
 $$
 
-For an undirected graph, $e_{ij}$ describes mixing across oriented edge endpoints, with each undirected edge contributing in both directions. The marginal $a_i$ is the fraction of edge endpoints in group $i$. Positive $r$ indicates same-type mixing, zero indicates the coefficient's random-mixing baseline, and negative values indicate cross-type mixing. This endpoint-based baseline differs from the node-count baseline above.
+For an undirected graph, $e_{ij}$ is the fraction of oriented edge connections from group $i$ to group $j$, with each undirected edge contributing in both directions. The marginal $a_i$ is therefore the fraction of all edge endpoints belonging to group $i$. Unlike the random-label expectation above, which depends on the numbers of developers in each group, assortativity uses the groups' shares of edge endpoints. This distinction matters because groups with higher average degree contribute disproportionately many endpoints.
+
+In this network, web developers account for approximately `r fmt(100 * (2 * mixing_summary$n[1] + mixing_summary$n[2]) / (2 * n_edges))`% of edge endpoints and ML developers account for `r fmt(100 * (2 * mixing_summary$n[3] + mixing_summary$n[2]) / (2 * n_edges))`%. The assortativity baseline for same-type mixing is therefore $a_W^2+a_M^2$, or approximately `r fmt(100 * sum(((2 * mixing_summary$n[c(1, 3)] + mixing_summary$n[2]) / (2 * n_edges))^2))`%, compared with the observed `r fmt(100 * same_type_fraction)`%. The coefficient divides this excess by the maximum possible excess above that baseline. Positive assortativity indicates more same-type mixing than the endpoint-based baseline, zero indicates agreement with that baseline, and negative assortativity indicates less same-type mixing.
 
 ```{r}
 #| label: assortativity
@@ -302,9 +304,11 @@ The observed value was met or exceeded by **`r n_exceed` of `r B`** permutations
 
 ## Interpretation and limitations
 
-The observed pattern is an association between specialty and connections, not proof that specialization causes developers to choose one another. Random labeling preserves every node's degree, but does **not** preserve the relationship between developer type and degree. Employer, location, and existing communities may also contribute.
+The observed network shows positive developer-type assortativity, and **`r n_exceed` of `r B`** random label assignments produced an assortativity coefficient at least as large as the observed value. This supports an association between developer type and the pattern of connections. It does not establish that specialization causes developers to choose same-type connections; employer, location, and existing communities may also contribute.
 
-The mixing table distinguishes group-specific patterns: an overall excess of same-type edges need not imply equally strong excess within both groups. A useful refinement is to shuffle labels within degree strata. An ERGM could address a more explicit model of tie formation, but requires careful specification and diagnostics; it is not fitted in this first pass.
+The mixing table and assortativity coefficient use different baselines and therefore provide complementary descriptions. Although ML-ML connections are close to their expectation under random labeling, this does not imply an absence of assortative mixing involving ML developers. Random labeling uses group sizes, whereas assortativity uses edge-endpoint shares. The latter baseline reflects the fact that ML developers contribute a smaller share of connection endpoints than their share of vertices.
+
+The permutation test asks whether the observed assortativity is unusually large when developer labels are exchangeable across vertices of the fixed graph. Each shuffle preserves the graph and group sizes, but changes which vertices carry each label and therefore changes the groups' degree distributions and endpoint shares. Thus, this test does not establish assortative mixing beyond what might be associated with differences in degree. Shuffling labels within degree strata would provide a useful sensitivity analysis by approximately preserving the relationship between developer type and degree.
 
 # Question 4: Predicting developer type from network characteristics
 
@@ -495,14 +499,14 @@ plot(roc_objects[["Network only"]], col = "#D87528", lwd = 2,
 
 The ROC curve shows how well network structure predicts developer type, with an AUC of **`r fmt(test_auc["Network only"], 3)`**.
 
-## Precision–recall AUC
+## Precision-recall AUC
 
-Because web developers outnumber machine learning developers roughly 3-to-1, we also evaluated the Precision–Recall AUC (PR-AUC).
+Because web developers outnumber machine learning developers roughly 3-to-1, we also evaluated the Precision-Recall AUC (PR-AUC).
 
 ```{r}
 #| label: fig-q4-pr
-#| fig-cap: "Held-out precision–recall curve for ML developers; the dashed line marks test-set ML prevalence."
-plot(pr_q4, color = "#2878A5", main = "Question 4: Precision–recall curve")
+#| fig-cap: "Held-out precision-recall curve for ML developers; the dashed line marks test-set ML prevalence."
+plot(pr_q4, color = "#2878A5", main = "Question 4: Precision-recall curve")
 abline(h = q4_pr_baseline, lty = 2, col = "gray40")
 ```
 
