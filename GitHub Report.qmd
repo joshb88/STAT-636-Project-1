@@ -151,6 +151,8 @@ We measure local clustering (the fraction of possible neighbor-to-neighbor conne
 
 ```{r}
 #| label: centrality
+#| cache: true
+#| cache.extra: !expr digest::digest(list(g, eda_df))
 eda_df$clustering <- transitivity(g, type = "local", isolates = "zero")
 eda_df$pagerank <- page_rank(g)$vector
 eda_df$betweenness <- betweenness(g, directed = FALSE, normalized = TRUE)
@@ -268,6 +270,8 @@ This uses the network as a whole rather than treating its edges as independent o
 
 ```{r}
 #| label: permutation-test
+#| cache: true
+#| cache.extra: !expr digest::digest(list(g, developer_type, observed_assortativity))
 set.seed(636)
 B <- 999L
 permuted_assortativity <- replicate(B, {
@@ -314,6 +318,8 @@ The scree plot indicates an elbow at $d=5$ (the green line), providing a choice 
 
 ```{r}
 #| label: spectral-features
+#| cache: true
+#| cache.extra: !expr digest::digest(g)
 set.seed(42)
 adjacency_spectrum <- spectrum(
   g, algorithm = "arpack", which = list(pos = "lm", howmany = 40)
@@ -408,6 +414,8 @@ for (label in c(0, 1)) {
 
 ```{r}
 #| label: fit-models
+#| cache: true
+#| cache.extra: !expr digest::digest(list(feature_matrix, network_matrix, combined_matrix, train_index, test_index, y_train, y_test, fold_id))
 predictor_sets <- list("Profile only" = feature_matrix,
                        "Network only" = network_matrix,
                        "Combined" = combined_matrix)
