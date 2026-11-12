@@ -8,7 +8,7 @@ author:
 format:
   html:
     toc: true
-    number-sections: true
+    number-sections: false
     code-fold: true
     code-summary: "Show R code"
     embed-resources: true
